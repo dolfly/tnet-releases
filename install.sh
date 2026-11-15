@@ -54,8 +54,22 @@ usage() {
 # means "this release does not publish that file", while a non-zero curl status
 # means the transfer itself broke (a truncated download would otherwise be
 # reported later as a checksum mismatch, which is misleading).
+#
+# The retry loop is in the shell rather than curl's --retry-all-errors, which
+# only exists from curl 7.71 on; nodes still run older curl than that.
 fetch() {
-    FETCH_CODE="$(curl -sSL --retry 3 --retry-all-errors --retry-delay 2 -o "$2" -w '%{http_code}' "$1" 2>/dev/null)"
+    local attempt=1
+    while :; do
+        FETCH_CODE="$(curl -sSL -o "$2" -w '%{http_code}' "$1" 2>/dev/null)"
+        case "$?" in
+        0) return 0 ;;
+        esac
+        if [ "$attempt" -ge 3 ]; then
+            return 1
+        fi
+        sleep "$attempt"
+        attempt=$((attempt + 1))
+    done
 }
 
 # latest_tag reads the tag out of the /releases/latest redirect, which needs no
