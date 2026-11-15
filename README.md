@@ -64,6 +64,6 @@ ghcr.io/dolfly/tnet:3.3.3   (= :3.3, :3, :latest)
 
 ## 升级提示
 
-- **v3.3.3 是断裂式升级**：gRPC 隧道服务名由 `GostTunel` 变为 `TnetTunel`，hub 与所有节点必须
+- **v3.3.3 是断裂式升级**：gRPC 隧道服务名改版（旧客户端打新 hub 直接握手失败），hub 与所有节点必须
   **同版本**，新旧不能混跑。升级窗口内先停节点、换二进制、再起。
 - 回滚就是装回上一版产物（`install.sh --install <旧 tag>`），配置目录 `/etc/tnet` 不需要回滚。
