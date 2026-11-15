@@ -48,8 +48,8 @@ gzip -dc tnet-linux-amd64-3.3.3.gz > tnet && chmod +x tnet && ./tnet -V
 ghcr.io/dolfly/tnet:3.3.3   (= :3.3, :3, :latest)
 ```
 
-镜像与 release 附件同源（garble + `-trimpath`，构建阶段过纯净度门禁）。镜像仓库目前是
-**private**，节点首次拉取需要 `docker login ghcr.io`（`read:packages` 权限即可）。
+镜像与 release 附件同源（garble + `-trimpath`，构建阶段过纯净度门禁）。镜像是**公开**
+package，`docker pull ghcr.io/dolfly/tnet:3.3.3` 不需要登录。
 
 ## 平台
 
