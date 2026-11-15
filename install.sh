@@ -37,6 +37,8 @@ API="https://api.github.com/repos/${REPO}"
 DL="https://github.com/${REPO}/releases/download"
 BIN="tnet"
 DEST="${TNET_DEST:-/usr/local/bin}"
+# Set by fetch() below; declared here so `set -u` never trips over it.
+FETCH_CODE=""
 
 die() {
     echo "Error: $*" >&2
@@ -47,11 +49,13 @@ usage() {
     sed -n '2,31p' "$0" | sed -e 's/^#//' -e 's/^ //'
 }
 
-# fetch <url> <out> downloads url into out and echoes the HTTP status code, so
-# callers can tell "this release has no such file" (404) apart from a network or
-# rate-limit failure (anything else).
+# fetch <url> <out> downloads url into out, leaves the HTTP status code in
+# FETCH_CODE and returns curl's own status. The two are needed separately: a 404
+# means "this release does not publish that file", while a non-zero curl status
+# means the transfer itself broke (a truncated download would otherwise be
+# reported later as a checksum mismatch, which is misleading).
 fetch() {
-    curl -sSL --retry 3 --retry-delay 2 -o "$2" -w '%{http_code}' "$1" 2>/dev/null
+    FETCH_CODE="$(curl -sSL --retry 3 --retry-all-errors --retry-delay 2 -o "$2" -w '%{http_code}' "$1" 2>/dev/null)"
 }
 
 # latest_tag reads the tag out of the /releases/latest redirect, which needs no
@@ -135,9 +139,11 @@ sha256_of() {
 # means the tag is not in the mirror, which is a different problem from a
 # network failure, so both get their own message.
 fetch_checksums() {
-    local tag="$1" dir="$2" code
-    code="$(fetch "${DL}/${tag}/SHA256SUMS" "${dir}/SHA256SUMS")"
-    case "$code" in
+    local tag="$1" dir="$2"
+    if ! fetch "${DL}/${tag}/SHA256SUMS" "${dir}/SHA256SUMS"; then
+        die "download of ${DL}/${tag}/SHA256SUMS was interrupted; check network access to github.com and re-run"
+    fi
+    case "$FETCH_CODE" in
     200) ;;
     404)
         die "release ${tag} not found in ${REPO} (no SHA256SUMS at ${DL}/${tag}/SHA256SUMS)
@@ -145,7 +151,7 @@ no token or login is needed for the public mirror, so a 404 here means the tag
 does not exist. Run '$0 --list' for the versions that are published."
         ;;
     *)
-        die "cannot download ${DL}/${tag}/SHA256SUMS (HTTP ${code}); check network access to github.com"
+        die "cannot download ${DL}/${tag}/SHA256SUMS (HTTP ${FETCH_CODE}); check network access to github.com"
         ;;
     esac
 }
@@ -154,8 +160,9 @@ does not exist. Run '$0 --list' for the versions that are published."
 # The name comes from SHA256SUMS, so a name that is not published cannot be
 # guessed and then fail later at download time.
 pick_asset() {
-    local tag="$1" os="$2" checksums="$3" arch name available
-    for arch in $(arch_candidates "$os"); do
+    local tag="$1" os="$2" checksums="$3" arch candidates name available wanted
+    candidates="$(arch_candidates "$os")"
+    for arch in $candidates; do
         name="$(awk -v pat="^${BIN}-${os}-${arch}(-[^/]*)?\\.(gz|zip)\$" '$2 ~ pat { print $2; exit }' "$checksums")"
         if [ -n "$name" ]; then
             echo "$name"
@@ -163,14 +170,15 @@ pick_asset() {
         fi
     done
     available="$(awk '{ print "  " $2 }' "$checksums")"
-    die "release ${tag} has no artifact for ${os}/$(uname -m)
+    wanted="$(echo "$candidates" | awk -v os="$os" 'BEGIN { ORS = "" } { printf "%s%s/%s", (NR > 1 ? ", " : ""), os, $1 }')"
+    die "release ${tag} has no artifact for ${wanted} (this machine: $(uname -s)/$(uname -m))
 published files:
 ${available}
 Set TNET_OS/TNET_ARCH to pick another target explicitly."
 }
 
 install_tnet() {
-    local tag="$1" os name dir expected actual url code native="" target
+    local tag="$1" os name dir expected actual url native="" target
     # The target is a system directory unless TNET_DEST overrides it, so the root
     # check only applies to the default destination.
     [ "$(id -u)" -eq 0 ] || [ -n "${TNET_DEST:-}" ] ||
@@ -181,12 +189,17 @@ install_tnet() {
     trap "rm -rf '${dir}'" EXIT
 
     fetch_checksums "$tag" "$dir"
-    name="$(pick_asset "$tag" "$os" "${dir}/SHA256SUMS")"
+    # pick_asset reports the full reason itself, so a failure only has to stop
+    # this shell: inside $( ) its `exit` would just end the substitution.
+    name="$(pick_asset "$tag" "$os" "${dir}/SHA256SUMS")" || exit 1
     url="${DL}/${tag}/${name}"
 
     echo "Downloading ${tag}: ${name}"
-    code="$(fetch "$url" "${dir}/${name}")"
-    [ "$code" = "200" ] || die "cannot download ${url} (HTTP ${code}); the mirror lists this file but github.com did not serve it"
+    if ! fetch "$url" "${dir}/${name}"; then
+        die "download of ${url} was interrupted; nothing was installed, re-run the installer"
+    fi
+    [ "$FETCH_CODE" = "200" ] ||
+        die "cannot download ${url} (HTTP ${FETCH_CODE}); the mirror lists this file but github.com did not serve it"
 
     expected="$(awk -v f="$name" '$2 == f { print $1 }' "${dir}/SHA256SUMS")"
     [ -n "$expected" ] || die "SHA256SUMS for ${tag} does not cover ${name}"
@@ -210,18 +223,23 @@ mismatch instead of installing."
     *) die "unexpected artifact type: ${name}" ;;
     esac
 
-    target="${DEST}/${BIN}"
-    if [ -f "${dir}/${BIN}.exe" ]; then
-        native="${dir}/${BIN}.exe"
-        # Windows only executes files that keep the .exe suffix.
-        if [ "$os" = windows ]; then
-            target="${DEST}/${BIN}.exe"
+    # The windows archives keep the versioned file name inside the zip
+    # (tnet-windows-amd64-3.3.3.exe), the unix ones are a plain gzip stream, so
+    # look for the binary under every name the packaging may have used.
+    native=""
+    for candidate in "${dir}/${BIN}" "${dir}/${BIN}.exe" "${dir}/${name%.*}" "${dir}/${name%.*}.exe"; do
+        if [ -f "$candidate" ]; then
+            native="$candidate"
+            break
         fi
-    elif [ -f "${dir}/${BIN}" ]; then
-        native="${dir}/${BIN}"
-    else
-        die "artifact ${name} does not contain ${BIN}"
-    fi
+    done
+    [ -n "$native" ] || die "artifact ${name} does not contain ${BIN}"
+
+    target="${DEST}/${BIN}"
+    case "$native" in
+    # Windows only executes files that keep the .exe suffix.
+    *.exe) if [ "$os" = windows ]; then target="${DEST}/${BIN}.exe"; fi ;;
+    esac
 
     echo "Installing to ${target}"
     mkdir -p "${DEST}" || die "cannot create ${DEST}"
@@ -246,7 +264,7 @@ GitHub API rate limit. Install a known version directly instead:
 }
 
 main() {
-    local action="menu" tag=""
+    local action="menu" tag="" versions
     case "${1:-}" in
     --install | -i) action="install" tag="${2:-${TNET_TAG:-}}" ;;
     --list | -l) action="list" ;;
@@ -264,7 +282,8 @@ main() {
         ;;
     menu)
         echo "Available tnet versions:"
-        select tag in $(list_versions); do
+        versions="$(list_versions)" || exit 1
+        select tag in $versions; do
             if [ -n "$tag" ]; then
                 install_tnet "$tag"
                 break
